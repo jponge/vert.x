@@ -11,7 +11,7 @@
 package io.vertx.tests.streams;
 
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.streams.WriteStreamOutputStream;
+import io.vertx.core.streams.impl.WriteStreamOutputStream;
 import io.vertx.test.core.VertxTestBase;
 import io.vertx.test.fakestream.FakeStream;
 

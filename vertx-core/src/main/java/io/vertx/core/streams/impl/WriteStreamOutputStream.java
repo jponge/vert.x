@@ -8,11 +8,12 @@
  *
  * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
  */
-package io.vertx.core.streams;
+package io.vertx.core.streams.impl;
 
 import io.vertx.core.Context;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.impl.WorkerExecutor;
+import io.vertx.core.streams.WriteStream;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;

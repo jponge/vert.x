@@ -11,13 +11,29 @@
 package io.vertx.core.streams;
 
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.streams.impl.ReadStreamInputStream;
+import io.vertx.core.streams.impl.WriteStreamOutputStream;
 
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Utility methods for bridging between Vert.x async streams and blocking I/O streams.
+ * Factory for bridging Vert.x async streams to blocking {@link InputStream} and {@link OutputStream}.
+ * <p>
+ * <strong>Input streams</strong> adapt a {@link ReadStream} of {@link Buffer} to a blocking {@link InputStream}.
+ * They must not be used from event-loop threads ({@link IllegalStateException} is thrown). Back-pressure is
+ * managed via high/low water marks: the source is paused when pending bytes reach the high water mark and
+ * resumed when they drop below the low water mark (high&nbsp;/&nbsp;4). On Vert.x worker threads, blocking
+ * reads cooperate with the worker executor so the thread is released during waits.
+ * <p>
+ * <strong>Output streams</strong> adapt a {@link WriteStream} of {@link Buffer} to a blocking {@link OutputStream}.
+ * A single producer thread is assumed; concurrent writes from multiple threads are not supported. Small writes are
+ * accumulated in an internal buffer and sent to the sink on {@link OutputStream#flush()} or
+ * {@link OutputStream#close()}; writes &gt;= {@code directWriteThreshold} bypass the accumulator and go directly
+ * to the sink. On worker/virtual threads, back-pressure blocks the caller when the sink's write queue is full.
+ * On event-loop threads, writes return immediately without back-pressure enforcement. By default,
+ * {@link OutputStream#close()} calls {@link WriteStream#end()} on the sink.
  */
 public interface JavaIOStreams {
 
