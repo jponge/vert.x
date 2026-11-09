@@ -169,6 +169,12 @@ public class WriteStreamOutputStream extends OutputStream {
       if (toFlush != null) {
         writeToSink(toFlush);
       }
+      lock.lock();
+      try {
+        checkClosed();
+      } finally {
+        lock.unlock();
+      }
       writeToSink(Buffer.buffer(len).appendBytes(b, off, len));
     } else {
       // Accumulate small writes

@@ -52,6 +52,7 @@ public class ReadStreamInputStream extends InputStream {
 
   private Buffer current;
   private int currentOffset;
+  private int currentBytesDeducted;
   private long pendingBytes;
 
   private final long timeout;
@@ -138,6 +139,7 @@ public class ReadStreamInputStream extends InputStream {
         }
         current = initialData;
         currentOffset = 0;
+        currentBytesDeducted = 0;
         pendingBytes += initialData.length();
         if (!paused && pendingBytes >= highWaterMark) {
           source.pause();
@@ -201,43 +203,48 @@ public class ReadStreamInputStream extends InputStream {
     }
   }
 
-  @Override
-  public int read() throws IOException {
-    checkEventLoop();
-
+  /**
+   * Ensures {@code current} is non-null by dequeuing from the queue, blocking if necessary.
+   *
+   * @return the current buffer, or {@code null} if the stream has ended and the queue is empty
+   */
+  private Buffer ensureCurrent() throws IOException {
     Buffer cur = current;
-    if (cur == null) {
-      lock.lock();
-      try {
-        while (queue.isEmpty() && state == ACTIVE) {
-          awaitProgress();
-        }
-        if (state == CLOSED) {
-          throw new IOException("Stream closed");
-        }
-        if (state == ERRORED) {
-          throw new IOException(error);
-        }
-        if (state == ENDED && queue.isEmpty()) {
-          return -1;
-        }
-        current = queue.poll();
-        currentOffset = 0;
-        cur = current;
-      } finally {
-        lock.unlock();
-      }
+    if (cur != null) {
+      return cur;
     }
-
-    byte b = cur.getByte(currentOffset++);
-
-    if (currentOffset >= cur.length()) {
-      int bufferLength = cur.length();
-      current = null;
+    lock.lock();
+    try {
+      while (queue.isEmpty() && state == ACTIVE) {
+        awaitProgress();
+      }
+      if (state == CLOSED) {
+        throw new IOException("Stream closed");
+      }
+      if (state == ERRORED) {
+        throw new IOException(error);
+      }
+      if (state == ENDED && queue.isEmpty()) {
+        return null;
+      }
+      current = queue.poll();
       currentOffset = 0;
+      currentBytesDeducted = 0;
+      return current;
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  private void releaseConsumedBuffer(int bufferLength) {
+    int remaining = bufferLength - currentBytesDeducted;
+    current = null;
+    currentOffset = 0;
+    currentBytesDeducted = 0;
+    if (remaining > 0) {
       lock.lock();
       try {
-        pendingBytes -= bufferLength;
+        pendingBytes -= remaining;
         if (paused && pendingBytes <= lowWaterMark) {
           source.resume();
           paused = false;
@@ -245,6 +252,22 @@ public class ReadStreamInputStream extends InputStream {
       } finally {
         lock.unlock();
       }
+    }
+  }
+
+  @Override
+  public int read() throws IOException {
+    checkEventLoop();
+
+    Buffer cur = ensureCurrent();
+    if (cur == null) {
+      return -1;
+    }
+
+    byte b = cur.getByte(currentOffset++);
+
+    if (currentOffset >= cur.length()) {
+      releaseConsumedBuffer(cur.length());
     }
 
     return b & 0xFF;
@@ -264,28 +287,9 @@ public class ReadStreamInputStream extends InputStream {
       return 0;
     }
 
-    Buffer cur = current;
+    Buffer cur = ensureCurrent();
     if (cur == null) {
-      lock.lock();
-      try {
-        while (queue.isEmpty() && state == ACTIVE) {
-          awaitProgress();
-        }
-        if (state == CLOSED) {
-          throw new IOException("Stream closed");
-        }
-        if (state == ERRORED) {
-          throw new IOException(error);
-        }
-        if (state == ENDED && queue.isEmpty()) {
-          return -1;
-        }
-        current = queue.poll();
-        currentOffset = 0;
-        cur = current;
-      } finally {
-        lock.unlock();
-      }
+      return -1;
     }
 
     int available = cur.length() - currentOffset;
@@ -294,19 +298,19 @@ public class ReadStreamInputStream extends InputStream {
     currentOffset += n;
 
     if (currentOffset >= cur.length()) {
-      current = null;
-      currentOffset = 0;
-    }
-
-    lock.lock();
-    try {
-      pendingBytes -= n;
-      if (paused && pendingBytes <= lowWaterMark) {
-        source.resume();
-        paused = false;
+      releaseConsumedBuffer(cur.length());
+    } else {
+      currentBytesDeducted += n;
+      lock.lock();
+      try {
+        pendingBytes -= n;
+        if (paused && pendingBytes <= lowWaterMark) {
+          source.resume();
+          paused = false;
+        }
+      } finally {
+        lock.unlock();
       }
-    } finally {
-      lock.unlock();
     }
 
     return n;
