@@ -18,9 +18,11 @@ import io.vertx.test.fakestream.FakeStream;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class WriteStreamOutputStreamTest extends VertxTestBase {
@@ -161,5 +163,68 @@ public class WriteStreamOutputStreamTest extends VertxTestBase {
     sink.resume();
     writer.join(5000);
     assertFalse(writer.isAlive());
+  }
+
+  // --- Item 1: Write timeout ---
+
+  @Test
+  public void testWriteTimeout() throws Exception {
+    FakeStream<Buffer> sink = new FakeStream<>();
+    sink.pause();
+    sink.setWriteQueueMaxSize(0);
+    sink.handler(b -> {});
+    try (WriteStreamOutputStream os = new WriteStreamOutputStream(sink, 100,
+        200, TimeUnit.MILLISECONDS)) {
+      byte[] large = new byte[200];
+
+      AtomicBoolean gotTimeout = new AtomicBoolean(false);
+      Thread writer = new Thread(() -> {
+        try {
+          os.write(large);
+        } catch (InterruptedIOException e) {
+          gotTimeout.set(e.getMessage().contains("timed out"));
+        } catch (IOException e) {
+          // wrong exception type
+        }
+      });
+      writer.start();
+      writer.join(5000);
+      assertFalse(writer.isAlive());
+      assertTrue(gotTimeout.get());
+    }
+  }
+
+  // --- Item 2: endOnClose ---
+
+  @Test
+  public void testCloseWithEndOnCloseTrue() throws Exception {
+    FakeStream<Buffer> sink = new FakeStream<>();
+    sink.handler(b -> {});
+    WriteStreamOutputStream os = new WriteStreamOutputStream(sink, 8192, true);
+    os.write("data".getBytes());
+    os.close();
+    assertTrue(sink.isEnded());
+  }
+
+  @Test
+  public void testCloseWithEndOnCloseFalse() throws Exception {
+    FakeStream<Buffer> sink = new FakeStream<>();
+    List<Buffer> written = new ArrayList<>();
+    sink.handler(written::add);
+    WriteStreamOutputStream os = new WriteStreamOutputStream(sink, 8192, false);
+    os.write("data".getBytes());
+    os.close();
+    assertEquals(1, written.size());
+    assertEquals("data", written.get(0).toString());
+    assertFalse(sink.isEnded());
+  }
+
+  @Test
+  public void testDefaultEndOnCloseIsTrue() throws Exception {
+    FakeStream<Buffer> sink = new FakeStream<>();
+    sink.handler(b -> {});
+    WriteStreamOutputStream os = new WriteStreamOutputStream(sink, 8192);
+    os.close();
+    assertTrue(sink.isEnded());
   }
 }

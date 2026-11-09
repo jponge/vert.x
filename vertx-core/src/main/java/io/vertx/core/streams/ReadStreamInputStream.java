@@ -12,13 +12,14 @@ package io.vertx.core.streams;
 
 import io.vertx.core.Context;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.impl.Utils;
 import io.vertx.core.impl.WorkerExecutor;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.util.ArrayDeque;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -52,6 +53,10 @@ public class ReadStreamInputStream extends InputStream {
   private int currentOffset;
   private long pendingBytes;
 
+  private final long timeout;
+  private final TimeUnit timeoutUnit;
+  private final Runnable onCloseBeforeEnd;
+
   private final ReentrantLock lock;
   private final Condition dataAvailable;
 
@@ -62,9 +67,54 @@ public class ReadStreamInputStream extends InputStream {
    * @param highWaterMark maximum bytes buffered before pausing the source
    */
   public ReadStreamInputStream(ReadStream<Buffer> source, int highWaterMark) {
+    this(source, highWaterMark, null, 0, TimeUnit.MILLISECONDS, null);
+  }
+
+  /**
+   * Create a new ReadStreamInputStream with a read timeout.
+   *
+   * @param source the source ReadStream
+   * @param highWaterMark maximum bytes buffered before pausing the source
+   * @param timeout the read timeout value, 0 means no timeout
+   * @param unit the time unit for the timeout
+   */
+  public ReadStreamInputStream(ReadStream<Buffer> source, int highWaterMark,
+                                long timeout, TimeUnit unit) {
+    this(source, highWaterMark, null, timeout, unit, null);
+  }
+
+  /**
+   * Create a new ReadStreamInputStream with initial data prepended.
+   *
+   * @param source the source ReadStream
+   * @param highWaterMark maximum bytes buffered before pausing the source
+   * @param initialData data to prepend before any data from the source, may be {@code null}
+   */
+  public ReadStreamInputStream(ReadStream<Buffer> source, int highWaterMark,
+                                Buffer initialData) {
+    this(source, highWaterMark, initialData, 0, TimeUnit.MILLISECONDS, null);
+  }
+
+  /**
+   * Create a new ReadStreamInputStream with all options.
+   *
+   * @param source the source ReadStream
+   * @param highWaterMark maximum bytes buffered before pausing the source
+   * @param initialData data to prepend before any data from the source, may be {@code null}
+   * @param timeout the read timeout value, 0 means no timeout
+   * @param unit the time unit for the timeout
+   * @param onCloseBeforeEnd callback invoked when the stream is closed before the source ends, may be {@code null}
+   */
+  public ReadStreamInputStream(ReadStream<Buffer> source, int highWaterMark,
+                                Buffer initialData,
+                                long timeout, TimeUnit unit,
+                                Runnable onCloseBeforeEnd) {
     this.source = source;
     this.highWaterMark = highWaterMark;
     this.lowWaterMark = highWaterMark / 4;
+    this.timeout = timeout;
+    this.timeoutUnit = unit;
+    this.onCloseBeforeEnd = onCloseBeforeEnd;
     this.queue = new ArrayDeque<>();
     this.lock = new ReentrantLock();
     this.dataAvailable = lock.newCondition();
@@ -74,6 +124,28 @@ public class ReadStreamInputStream extends InputStream {
     source.endHandler(v -> handleEnd());
     source.exceptionHandler(this::handleError);
     source.resume();
+
+    prependInitialData(initialData);
+  }
+
+  private void prependInitialData(Buffer initialData) {
+    if (initialData != null && initialData.length() > 0) {
+      lock.lock();
+      try {
+        if (current != null) {
+          queue.addFirst(current);
+        }
+        current = initialData;
+        currentOffset = 0;
+        pendingBytes += initialData.length();
+        if (!paused && pendingBytes >= highWaterMark) {
+          source.pause();
+          paused = true;
+        }
+      } finally {
+        lock.unlock();
+      }
+    }
   }
 
   private void handleData(Buffer buffer) {
@@ -254,11 +326,13 @@ public class ReadStreamInputStream extends InputStream {
 
   @Override
   public void close() throws IOException {
+    boolean wasActive;
     lock.lock();
     try {
       if (state == CLOSED) {
         return;
       }
+      wasActive = (state == ACTIVE);
       state = CLOSED;
       try {
         if (paused) {
@@ -277,28 +351,49 @@ public class ReadStreamInputStream extends InputStream {
     } finally {
       lock.unlock();
     }
+    if (wasActive && onCloseBeforeEnd != null) {
+      try {
+        onCloseBeforeEnd.run();
+      } catch (Exception ignored) {
+      }
+    }
   }
 
-  private void awaitProgress() {
+  private void awaitProgress() throws IOException {
     WorkerExecutor executor = WorkerExecutor.unwrapWorkerExecutor();
     if (executor != null) {
       WorkerExecutor.Execution execution = executor.currentExecution();
       CountDownLatch latch = execution.trySuspend();
       try {
-        dataAvailable.await();
+        boolean signaled = awaitWithTimeout(dataAvailable);
         lock.unlock();
         execution.resume();
         latch.await();
         lock.lock();
+        if (!signaled) {
+          throw new InterruptedIOException("Read timed out");
+        }
       } catch (InterruptedException e) {
-        Utils.throwAsUnchecked(e);
+        Thread.currentThread().interrupt();
+        throw new InterruptedIOException();
       }
     } else {
       try {
-        dataAvailable.await();
+        if (!awaitWithTimeout(dataAvailable)) {
+          throw new InterruptedIOException("Read timed out");
+        }
       } catch (InterruptedException e) {
-        Utils.throwAsUnchecked(e);
+        Thread.currentThread().interrupt();
+        throw new InterruptedIOException();
       }
     }
+  }
+
+  private boolean awaitWithTimeout(Condition condition) throws InterruptedException {
+    if (timeout > 0) {
+      return condition.await(timeout, timeoutUnit);
+    }
+    condition.await();
+    return true;
   }
 }

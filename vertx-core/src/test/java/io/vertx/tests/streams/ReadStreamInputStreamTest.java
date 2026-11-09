@@ -17,6 +17,9 @@ import io.vertx.test.fakestream.FakeStream;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ReadStreamInputStreamTest extends VertxTestBase {
 
@@ -164,6 +167,166 @@ public class ReadStreamInputStreamTest extends VertxTestBase {
     assertFalse(reader.isAlive());
     assertEquals(5, result[0]);
     assertEquals("hello", new String(data, 0, result[0]));
+    is.close();
+  }
+
+  // --- Item 1: Read timeout ---
+
+  @Test
+  public void testReadTimeout() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    long start = System.nanoTime();
+    try (ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        200, TimeUnit.MILLISECONDS)) {
+      int ignored = is.read();
+      fail("Expected InterruptedIOException");
+    } catch (InterruptedIOException e) {
+      long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+      assertTrue("Timeout took " + elapsed + "ms", elapsed >= 150 && elapsed < 5000);
+      assertTrue(e.getMessage().contains("timed out"));
+    }
+  }
+
+  @Test
+  public void testReadTimeoutBulk() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    try (ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        200, TimeUnit.MILLISECONDS)) {
+      byte[] buf = new byte[10];
+      int ignored = is.read(buf, 0, 10);
+      fail("Expected InterruptedIOException");
+    } catch (InterruptedIOException e) {
+      assertTrue(e.getMessage().contains("timed out"));
+    }
+  }
+
+  @Test
+  public void testNoTimeoutWhenDataAvailable() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    try (ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        200, TimeUnit.MILLISECONDS)) {
+      source.write(Buffer.buffer("hello"));
+      source.end();
+      byte[] buf = new byte[5];
+      int n = is.read(buf, 0, 5);
+      assertEquals(5, n);
+      assertEquals("hello", new String(buf, 0, n));
+    }
+  }
+
+  // --- Item 4: InterruptedIOException instead of sneaky-throw ---
+
+  @Test
+  public void testInterruptedReadThrowsInterruptedIOException() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    ReadStreamInputStream is = new ReadStreamInputStream(source, 65536);
+    AtomicBoolean gotCorrectException = new AtomicBoolean(false);
+    AtomicBoolean interruptFlagPreserved = new AtomicBoolean(false);
+    Thread reader = new Thread(() -> {
+      try {
+        int ignored = is.read();
+      } catch (InterruptedIOException e) {
+        gotCorrectException.set(true);
+        interruptFlagPreserved.set(Thread.currentThread().isInterrupted());
+      } catch (IOException e) {
+        // wrong exception type
+      }
+    });
+    reader.start();
+    assertWaitUntil(() -> reader.getState() == Thread.State.WAITING);
+    reader.interrupt();
+    reader.join(5000);
+    assertFalse(reader.isAlive());
+    assertTrue(gotCorrectException.get());
+    assertTrue(interruptFlagPreserved.get());
+    is.close();
+  }
+
+  // --- Item 3: Initial buffer prepend ---
+
+  @Test
+  public void testInitialData() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    Buffer initial = Buffer.buffer("prefix-");
+    try (ReadStreamInputStream is = new ReadStreamInputStream(source, 65536, initial)) {
+      source.write(Buffer.buffer("suffix"));
+      source.end();
+      byte[] buf = new byte[100];
+      int n = is.read(buf, 0, 100);
+      assertEquals(7, n);
+      assertEquals("prefix-", new String(buf, 0, n));
+      n = is.read(buf, 0, 100);
+      assertEquals(6, n);
+      assertEquals("suffix", new String(buf, 0, n));
+      assertEquals(-1, is.read(buf, 0, 100));
+    }
+  }
+
+  @Test
+  public void testInitialDataNull() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    try (ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        null)) {
+      source.write(Buffer.buffer("data"));
+      source.end();
+      byte[] buf = new byte[4];
+      assertEquals(4, is.read(buf, 0, 4));
+      assertEquals("data", new String(buf, 0, 4));
+    }
+  }
+
+  @Test
+  public void testInitialDataEmpty() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    try (ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        Buffer.buffer())) {
+      source.write(Buffer.buffer("data"));
+      source.end();
+      byte[] buf = new byte[4];
+      assertEquals(4, is.read(buf, 0, 4));
+    }
+  }
+
+  @Test
+  public void testInitialDataBackPressure() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    Buffer initial = Buffer.buffer(new byte[120]);
+    try (ReadStreamInputStream ignored = new ReadStreamInputStream(source, 100, initial)) {
+      assertTrue(source.isPaused());
+    }
+  }
+
+  // --- Item 5: Close-before-end callback ---
+
+  @Test
+  public void testOnCloseBeforeEndCallback() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    AtomicBoolean callbackFired = new AtomicBoolean(false);
+    ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        null, 0, TimeUnit.MILLISECONDS, () -> callbackFired.set(true));
+    source.write(Buffer.buffer("data"));
+    is.close();
+    assertTrue(callbackFired.get());
+  }
+
+  @Test
+  public void testOnCloseAfterEndNoCallback() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    AtomicBoolean callbackFired = new AtomicBoolean(false);
+    ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        null, 0, TimeUnit.MILLISECONDS, () -> callbackFired.set(true));
+    source.end();
+    byte[] buf = new byte[10];
+    assertEquals(-1, is.read(buf, 0, 10));
+    is.close();
+    assertFalse(callbackFired.get());
+  }
+
+  @Test
+  public void testOnCloseBeforeEndNullCallback() throws Exception {
+    FakeStream<Buffer> source = new FakeStream<>();
+    ReadStreamInputStream is = new ReadStreamInputStream(source, 65536,
+        null, 0, TimeUnit.MILLISECONDS, null);
     is.close();
   }
 }

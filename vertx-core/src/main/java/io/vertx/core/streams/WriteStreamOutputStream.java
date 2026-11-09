@@ -12,12 +12,13 @@ package io.vertx.core.streams;
 
 import io.vertx.core.Context;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.impl.Utils;
 import io.vertx.core.impl.WorkerExecutor;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -41,6 +42,9 @@ public class WriteStreamOutputStream extends OutputStream {
   private final WriteStream<Buffer> sink;
   private Buffer accumulator;
   private final int directWriteThreshold;
+  private final boolean endOnClose;
+  private final long timeout;
+  private final TimeUnit timeoutUnit;
   private Throwable error;
   private boolean closed;
   private final ReentrantLock lock;
@@ -53,8 +57,50 @@ public class WriteStreamOutputStream extends OutputStream {
    * @param directWriteThreshold writes >= this size bypass the accumulator
    */
   public WriteStreamOutputStream(WriteStream<Buffer> sink, int directWriteThreshold) {
+    this(sink, directWriteThreshold, true, 0, TimeUnit.MILLISECONDS);
+  }
+
+  /**
+   * Create a new WriteStreamOutputStream with an endOnClose flag.
+   *
+   * @param sink the sink WriteStream
+   * @param directWriteThreshold writes >= this size bypass the accumulator
+   * @param endOnClose whether {@link #close()} should call {@link WriteStream#end()} on the sink
+   */
+  public WriteStreamOutputStream(WriteStream<Buffer> sink, int directWriteThreshold,
+                                  boolean endOnClose) {
+    this(sink, directWriteThreshold, endOnClose, 0, TimeUnit.MILLISECONDS);
+  }
+
+  /**
+   * Create a new WriteStreamOutputStream with a write timeout.
+   *
+   * @param sink the sink WriteStream
+   * @param directWriteThreshold writes >= this size bypass the accumulator
+   * @param timeout the write timeout value, 0 means no timeout
+   * @param unit the time unit for the timeout
+   */
+  public WriteStreamOutputStream(WriteStream<Buffer> sink, int directWriteThreshold,
+                                  long timeout, TimeUnit unit) {
+    this(sink, directWriteThreshold, true, timeout, unit);
+  }
+
+  /**
+   * Create a new WriteStreamOutputStream with all options.
+   *
+   * @param sink the sink WriteStream
+   * @param directWriteThreshold writes >= this size bypass the accumulator
+   * @param endOnClose whether {@link #close()} should call {@link WriteStream#end()} on the sink
+   * @param timeout the write timeout value, 0 means no timeout
+   * @param unit the time unit for the timeout
+   */
+  public WriteStreamOutputStream(WriteStream<Buffer> sink, int directWriteThreshold,
+                                  boolean endOnClose, long timeout, TimeUnit unit) {
     this.sink = sink;
     this.directWriteThreshold = directWriteThreshold;
+    this.endOnClose = endOnClose;
+    this.timeout = timeout;
+    this.timeoutUnit = unit;
     this.accumulator = Buffer.buffer(directWriteThreshold);
     this.lock = new ReentrantLock();
     this.drainCondition = lock.newCondition();
@@ -174,7 +220,9 @@ public class WriteStreamOutputStream extends OutputStream {
     if (toFlush != null) {
       writeToSink(toFlush);
     }
-    sink.end();
+    if (endOnClose) {
+      sink.end();
+    }
   }
 
   private void checkClosed() throws IOException {
@@ -217,26 +265,41 @@ public class WriteStreamOutputStream extends OutputStream {
     }
   }
 
-  private void awaitDrain() {
+  private void awaitDrain() throws IOException {
     WorkerExecutor executor = WorkerExecutor.unwrapWorkerExecutor();
     if (executor != null) {
       WorkerExecutor.Execution execution = executor.currentExecution();
       CountDownLatch latch = execution.trySuspend();
       try {
-        drainCondition.await();
+        boolean signaled = awaitDrainWithTimeout();
         lock.unlock();
         execution.resume();
         latch.await();
         lock.lock();
+        if (!signaled) {
+          throw new InterruptedIOException("Write timed out");
+        }
       } catch (InterruptedException e) {
-        Utils.throwAsUnchecked(e);
+        Thread.currentThread().interrupt();
+        throw new InterruptedIOException();
       }
     } else {
       try {
-        drainCondition.await();
+        if (!awaitDrainWithTimeout()) {
+          throw new InterruptedIOException("Write timed out");
+        }
       } catch (InterruptedException e) {
-        Utils.throwAsUnchecked(e);
+        Thread.currentThread().interrupt();
+        throw new InterruptedIOException();
       }
     }
+  }
+
+  private boolean awaitDrainWithTimeout() throws InterruptedException {
+    if (timeout > 0) {
+      return drainCondition.await(timeout, timeoutUnit);
+    }
+    drainCondition.await();
+    return true;
   }
 }
